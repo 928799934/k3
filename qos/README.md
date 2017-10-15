@@ -8,9 +8,15 @@
 
 ## 修改点
 修改qos文件中以下配置
+
 我是PPPOE拨号 上传15M 下载94M
+
 配置如下
+
 DEV="eth0"
+
 UPLINK=13000
+
 DOWNLINK=80000
+
 
