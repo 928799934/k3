@@ -1,7 +1,13 @@
 ## QOS 限速脚本
+tc + iptables 完成限速
 
 ## 说明
 解决K3路由器在PPPOE 模式下 qos 无效的问题
+
+仅分流了下载与http普通请求
+
+## BUGs
+暂时无法分离http下载
 
 ## 支持环境
 官改root版
