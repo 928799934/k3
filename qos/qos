@@ -1,0 +1,166 @@
+#!/bin/sh
+DEV="eth0"
+UPLINK=13000
+DOWNLINK=80000
+BASE=`expr $UPLINK \/ 20`
+SECOND=`expr $BASE \* 19`
+HTTP=`expr $BASE \* 15`
+OTHER=`expr $BASE \* 4`
+
+echo "==================== Packetfilter and Traffic Control ===================="
+start_routing() {
+echo "队列设置开始start......"
+#1.增加一个根队列，没有进行分类的数据包都走这个1:22是缺省类:
+tc qdisc add dev $DEV root handle 1: htb default 22
+#1.1增加一个根队下面主干类1: 速率为$UPLINK k
+tc class add dev $DEV parent 1: classid 1:1 htb rate ${UPLINK}kbit ceil ${UPLINK}kbit
+#1.1.1 在主干类1下建立第一叶子类,这是一个最高优先权的类.需要高优先和高速的包走这条通道,比如SYN,ACK,ICMP等
+tc class add dev $DEV parent 1:1 classid 1:11 htb rate ${UPLINK}kbit ceil ${UPLINK}kbit prio 1
+#1.2 在根类下建立次干类 classid 1:2 。此次干类的下面全部优先权低于主干类,以防重要数据堵塞.
+tc class add dev $DEV parent 1: classid 1:2 htb rate ${SECOND}kbit ceil ${SECOND}kbit
+#1.2.1 在次干类下建立第一叶子类,可以跑例如http.
+tc class add dev $DEV parent 1:2 classid 1:21 htb rate ${HTTP}kbit ceil ${SECOND}kbit prio 2
+#1.2.4 在次干类下建立第二叶子类。无所谓的数据通道,无需要太多的带宽,以防无所谓的人在阻碍正务.
+tc class add dev $DEV parent 1:2 classid 1:22 htb rate ${OTHER}kbit ceil ${HTTP}kbit prio 3
+
+#在每个类下面再附加上另一个队列规定,随机公平队列(SFQ)，不被某个连接不停占用带宽,以保证带宽的平均公平使用：
+#SFQ(Stochastic Fairness Queueing，随机公平队列),SFQ的关键词是“会话”(或称作“流”) ，
+#主要针对一个TCP会话或者UDP流。流量被分成相当多数量的FIFO队列中，每个队列对应一个会话。
+#数据按照简单轮转的方式发送, 每个会话都按顺序得到发送机会。这种方式非常公平，保证了每一
+#个会话都不会没其它会话所淹没。SFQ之所以被称为“随机”，是因为它并不是真的为每一个会话创建
+#一个队列，而是使用一个散列算法，把所有的会话映射到有限的几个队列中去。
+#参数perturb是多少秒后重新配置一次散列算法。默认为10
+tc qdisc add dev $DEV parent 1:11 handle 111: sfq perturb 5
+tc qdisc add dev $DEV parent 1:21 handle 121: sfq perturb 10
+tc qdisc add dev $DEV parent 1:22 handle 122: sfq perturb 10
+echo "队列设置成功.done."
+echo "设置包过滤 Setting up Filters......"
+#这里设置过滤器,handle 是iptables作mark的值,让被iptables 在mangle链做了mark的不同的值选择不同的通
+#道classid,而prio 是过滤器的优先级别.
+tc filter add dev $DEV parent 1: protocol ip prio 1 handle 1 fw classid 1:11
+tc filter add dev $DEV parent 1: protocol ip prio 2 handle 2 fw classid 1:21
+tc filter add dev $DEV parent 1: protocol ip prio 3 handle 3 fw classid 1:22
+echo "设置过滤器成功.done."
+#6. 下行的限制:
+#设置入队的规则,是因为把一些经常会造成下载大文件的端口进行控制,不让它们来得太快,导致堵塞.来得太快
+#的就直接drop,就不会浪费和占用机器时间和力量去处理了.
+#(1). 把下行速率控制在大概1000-1500k左右,因为这个速度已经足够用了,以便能够得到更多的并发下载连接
+tc qdisc add dev $DEV handle ffff: ingress
+tc filter add dev $DEV parent ffff: protocol ip prio 50 handle 8 fw police rate ${DOWNLINK}kbit burst 10k drop flowid :8
+}
+
+#7. 开始给数据包打标记，往PREROUTING链中添加mangle规则：
+start_mangle() {
+echo "开始给数据包打标记......start mangle mark......"
+##提高tcp初始连接(也就是带有SYN的数据包)的优先权是非常明智的：
+iptables -t mangle -A PREROUTING -p tcp -m tcp --tcp-flags SYN,RST,ACK SYN -j MARK --set-mark 1
+iptables -t mangle -A PREROUTING -p tcp -m tcp --tcp-flags SYN,RST,ACK SYN -j RETURN
+#######icmp,想ping有良好的反应,放在第一类吧.
+iptables -t mangle -A PREROUTING -p icmp -j MARK --set-mark 1
+iptables -t mangle -A PREROUTING -p icmp -j RETURN
+###提高ssh数据包的优先权：放在第1类,要知道ssh是交互式的和重要的,不容待慢哦
+iptables -t mangle -A PREROUTING -p tcp -m tcp --dport 22 -j MARK --set-mark 1
+iptables -t mangle -A PREROUTING -p tcp -m tcp --dport 22 -j RETURN
+### name-domain server：放在第1类,这样连接带有域名的连接才能快速找到对应的地址,提高速度的一法
+iptables -t mangle -A PREROUTING -p udp -m udp --dport 53 -j MARK --set-mark 1
+iptables -t mangle -A PREROUTING -p udp -m udp --dport 53 -j RETURN
+#small packets (probably just ACKs)长度小于64的小包通常是需要快些的,一般是用来确认tcp的连接的,
+#让它跑快些的通道吧.也可以把下面两行屏蔽,因为再下面有更多更明细的端口分类.
+#iptables -t mangle -A PREROUTING -p tcp -m length --length :64 -j MARK --set-mark 2
+#iptables -t mangle -A PREROUTING -p tcp -m length --length :64 -j RETURN
+### http：放在第3类,是最常用的,最多人用的,
+iptables -t mangle -A PREROUTING -p tcp -m tcp --dport 80 -j MARK --set-mark 2
+iptables -t mangle -A PREROUTING -p tcp -m tcp --dport 80 -j RETURN
+iptables -t mangle -A PREROUTING -p tcp -m tcp --sport 80 -j MARK --set-mark 8
+iptables -t mangle -A PREROUTING -p tcp -m tcp --sport 80 -j RETURN
+### https：放在第3类
+iptables -t mangle -A PREROUTING -p tcp -m tcp --dport 443 -j MARK --set-mark 2
+iptables -t mangle -A PREROUTING -p tcp -m tcp --dport 443 -j RETURN
+iptables -t mangle -A PREROUTING -p tcp -m tcp --sport 443 -j MARK --set-mark 8
+iptables -t mangle -A PREROUTING -p tcp -m tcp --sport 443 -j RETURN
+
+##提高本地数据包的优先权：放在第1
+iptables -t mangle -A OUTPUT -p tcp -m tcp --dport 22 -j MARK --set-mark 1
+iptables -t mangle -A OUTPUT -p tcp -m tcp --dport 22 -j RETURN
+
+iptables -t mangle -A OUTPUT -p icmp -j MARK --set-mark 1
+iptables -t mangle -A OUTPUT -p icmp -j RETURN
+
+##本地small packets (probably just ACKs)
+#iptables -t mangle -A OUTPUT -p tcp -m length --length :64 -j MARK --set-mark 1
+#iptables -t mangle -A OUTPUT -p tcp -m length --length :64 -j RETURN
+#
+#(4). 向PREROUTING中添加完mangle规则后，用这条规则结束PREROUTING表：
+#也就是说前面没有打过标记的数据包将交给1:24处理。
+#实际上是不必要的，因为1:24是缺省类，但仍然打上标记是为了保持整个设置的协调一致，而且这样
+#还能看到规则的包计数。
+iptables -t mangle -A PREROUTING -i $DEV -j MARK --set-mark 3
+echo "标记完毕! mangle mark done!"
+}
+
+#8.取消mangle标记用的自定义函数
+stop_mangle() {
+echo "停止数据标记 stop mangle table......"
+( iptables -t mangle -F && echo "ok." ) || echo "error."
+}
+
+#9.取消队列用的
+stop_routing() {
+echo "(删除所有队列......)"
+( tc qdisc del dev $DEV root && tc qdisc del dev $DEV ingress && echo "ok.删除成功!" ) || echo "error."
+}
+
+#10.显示状态
+status() {
+echo "1.show qdisc $DEV (显示上行队列):----------------------------------------------"
+tc -s qdisc show dev $DEV
+echo "2.show class $DEV (显示上行分类):----------------------------------------------"
+tc class show dev $DEV
+echo "3. tc -s class show dev $DEV (显示上行队列和分类流量详细信息):------------------"
+tc -s class show dev $DEV
+echo "说明:设置总队列上行带宽 $UPLINK k."
+echo "1. classid 1:11 ssh、dns、和带有SYN标记的数据包。这是最高优先权的类包并最先类 "
+echo "3. classid 1:21 web "
+echo "6. classid 1:22 其他服务 "
+}
+
+#11.显示帮助
+usage() {
+echo "使用方法(usage): `basename $0` [start | stop | restart | status | mangle ]"
+echo "参数作用:"
+echo "start 开始流量控制"
+echo "stop 停止流量控制"
+echo "restart 重启流量控制"
+echo "status 显示队列流量"
+echo "mangle 显示mark标记"
+}
+
+case "$1" in
+start)
+( start_routing && start_mangle && echo "开始流量控制! TC started!" ) || echo "error."
+exit 0
+;;
+stop)
+( stop_routing && stop_mangle && echo "停止流量控制! TC stopped!" ) || echo "error."
+exit 0
+;;
+restart)
+stop_routing
+stop_mangle
+start_routing
+start_mangle
+echo "流量控制规则重新装载!"
+;;
+status)
+status
+;;
+mangle)
+echo -n "iptables -t mangle -L (显示目前mangle表表标记详细):"
+iptables -t mangle -nL
+;;
+*) usage
+exit 1
+;;
+esac
+echo -n "script done!"
+exit 1
